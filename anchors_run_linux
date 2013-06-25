@@ -1,0 +1,970 @@
+#!/usr/local/bin/perl
+##!/usr/bin/perl
+##!/usr/local/bin/perl5
+
+#!### require the needed Perl distributed packages ###
+use Getopt::Long;
+
+#!### require the needed custom packages ###
+use XDB qw(time_check);
+use FileSysProc qw(ops_open);
+use CIAO;
+use OutputText;
+use Parameter;
+use lib '/proj/axaf/simul/lib/perl';
+use Expect;
+use CXC::Envs;
+use CXC::Archive;
+
+#!### set some global variables ###
+my $ASCDSVERS  = '3.4';		      # the version of CIAO we work with
+my $MODDATE    = '02/07/07';	      # the date the script was last modified
+my $VERSION    = '1.0';		      # the current version of anchors_run_obsid
+my $ANCH_VERS  = '3.3.2.2';	      # the current version of ANCHORS
+my $ASCDS_VERS = $ENV{ASCDS_VERSION}; # the current version of ASCDS
+my $YAXX_DIR   = $ENV{yaxx};          # the yaxx directory
+my $YAXX_BIN   = "${YAXX_DIR}"."/bin";# the yaxx bin directory where the scripts are kept
+my $BIN_LINUX  = "${YAXX_DIR}"."/bin_linux";# the yaxx bin directory where the post_yaxx scripts are kept
+my $YAXX_EXE   = "${YAXX_BIN}"."/yaxx/yaxx"; # the yaxx executable
+my $PATH       = $ENV{PATH};          #
+my $STARTED    = time_check();        # the GMT date at the start of execution
+my $PARAMFILE;                        # the parameter file into which we'll store our processing progress and settings
+my $OBSID;			      # the obsid we are processing
+my $OBI;			      # the obi we are processing
+my $CONTINUE;			      # flag to continue from an interrupted previous run
+my $DEBUG;			      # the default debug flag value
+my $YAXX_SRC;                         # optional flag to run only particular sources through yaxx (must be a quoted list separated by whitespace)
+my $YAXX_PRECLEAN;                    # optional flag to set yaxx preclean option to "all" "region" "extract" "fit" "source_image" "report" "log" or "resources_dir"
+my $POST_YAXX_OPT;                    # optional flag to set post_yaxx options
+
+#!### global variables to set the processing settings ###
+my %THREADS;			      # a hash to track the status of each processing step
+my $FROOT;                            # if the user sets this it will override the default root name
+my $CLOBBER = 'yes';		      # if the user defines the value it will override this default
+
+#!### process the input arguments ###
+my $getopt = GetOptions(
+			'obsid=i'         => \$OBSID,
+			'obi=i'           => \$OBI,
+			'debug'           => \$DEBUG,
+			'continue'        => \$CONTINUE,
+			'clobber=s'       => \$CLOBBER,
+			'yaxx_src=s'      => \$YAXX_SRC,          # syntax - must be quoted list: "<src1> <src2> ..."
+			'yaxx_preclean=s' => \$YAXX_PRECLEAN,     # valid options: "all" "region" "extract" "fit" "source_image" "report" "log" "resources_dir"
+			'post_yaxx_opt=s' => \$POST_YAXX_OPT,
+			'h|help'          => sub { &Showtheusage },
+			);
+
+#!### show the usage if there was an error parsing the arguments ###
+&Showtheusage unless $getopt;
+
+#!### setup signal handling (Ctrl-C will tell the script to exit cleanly) ###
+$SIG{TERM} = sub { &Shutdown(1); };
+
+#!### confirm that this is the anchors account ###
+my $id_anchors = `id -a anchors | cut -f2 -d= | cut -f1 -d'('`;
+my $id_user=`id | cut -f2 -d= | cut -f1 -d'('`;
+my $username=`id | cut -f2 -d= | cut -f2 -d'(' | cut -f1 -d')'`;
+unless ($id_anchors == $id_user)
+  {
+    print "ERROR: Please log in as anchors.  You are logged in as $username\n";
+    exit 1;
+  }
+
+#!### check that the current CIAO version is our expected version ###
+unless (ops_open *VERS, '<', "$ENV{ASCDS_INSTALL}/VERSION")
+  {
+    print "failed to verify CIAO release version, cannot open '$ENV{ASCDS_INSTALL}/VERSION'";
+    exit 1;
+  }
+my @ascds = <VERS>;
+close VERS;
+@ascds    = split /\s+/, $ascds[0];
+unless ("$ascds[1]" eq $ASCDSVERS)
+  {
+    print "current CIAO version, $ascds[1], has not been verified as compatible with ANCHORS (expected version $ASCDSVERS)\n";
+    exit 1;
+  }
+
+#!### this ends the configuration portion of the script ###
+
+#!### setup portion of the script: setup/verify directories, input files, initialize global objects ###
+
+#!### set up the directories ###
+my $OBSID2  = (sprintf '%05d', $OBSID);
+my $WORKDIR = "$YAXX_DIR"."/"."$OBSID2";
+
+#!### create the working directory if it doesn't exist ###
+if (! -d $WORKDIR && ! (mkdir $WORKDIR, 0770))
+  {
+    print "ERROR: cannot create working directory '$WORKDIR'\n";
+    exit 1;
+  }
+
+#!### create CIAO and OutputText objects ###
+my $ciao = CIAO->new(-workdir=>$WORKDIR, -debug=>$DEBUG, -clobber=>$CLOBBER, -obsid=>$OBSID, -obsid2=>$OBSID2);
+my $txt  = $ciao->txt;
+
+#!### initialize the working and wavedir directories ###
+unless ($ciao->init_workdir($OBSID,$OBSID2))
+  {
+    $txt->print(-error=>"cannot process without configured work directory, exiting...");
+    &Shutdown(1);
+  }
+
+my $OBSDIR   = "${WORKDIR}"."/".($ciao->obsdir);
+my $WAVDIR   = "${WORKDIR}"."/".($ciao->wavedir);
+my $PARAMDIR = "${WORKDIR}"."/".($ciao->paramdir);
+
+#!### set up the parameter and log files ###
+my $PARAMFILE = "${PARAMDIR}"."/anchors_reduce.par";
+my $LOGFILE = "${OBSDIR}"."/anchors"."$OBSID".".log";
+
+#!### open the log file ###
+print OUT "ANCHORS Processing initiated at $STARTED GMT\n";
+$txt->print(-body=>"started at $STARTED GMT");
+
+#!### initialize the status of each script in a tracking hash (Q = queued for processing) ###
+
+%THREADS = (
+	    # Step 0
+	    collect_data	=> 'Q',
+	    merge_asol		=> 'Q',
+	    acis_process_events => 'Q',
+	    # Step 1
+	    wave_detect         => 'Q',
+	    process_source_reg  => 'Q',
+	    mk_psf_ellipse      => 'Q',
+	    # Step 2
+	    configure_yaxx      => 'Q',
+	    run_yaxx            => 'Q',
+	    # Step 3
+	    run_post_yaxx       => 'Q',
+	   );
+#!### if we are in continue mode, init the cache and settings where we left off ###
+if ($CONTINUE)
+  {
+    #!###
+    &ReadinParams || &Shutdown(1);
+
+    #!### now read in the previously stored cache ###
+    unless ($ciao->retrieve_cache)
+    {
+      $txt->print(-error=>"failed to retrieve cache from previous run");
+      &Shutdown(1);
+    }
+  }
+
+#!### this ends the setup portion of the script, all flags, variables, and directories needed for processing are ready ###
+
+#!### now we'll enter the actual execution section where processing is done ###
+
+#!### print out a processing header that tells about the xatlas_reduce processing session ###
+my $h = "+----------------------------------+\n";
+$h   .= "| anchors_run_obsid - Version $VERSION\n";
+$h   .= "| ANCHORS Version $ANCH_VERS\n";
+$h   .= "| Obsid: $OBSID\n";
+$h   .= "| Processing Directory:\n";
+$h   .= "|  $WORKDIR\n";
+$h   .= "+----------------------------------+";
+$txt->print(-body=>$h);
+$h    = undef;
+
+#!### run through the CIAO thread pipeline ###
+$txt->print(-start=>"thread processing is starting");
+&ProcessANCHORSPipeline || &Shutdown(1);
+
+#!### if we got this far, processing is complete and completed successfully ###
+$txt->print(-cmpl=>"processing completed successfully");
+&Shutdown(0);
+
+#!#################
+#! SUBROUTINES
+#!#################
+
+#!### Showtheusage will show the version and usage info ###
+sub Showtheusage
+  {
+    print << "EOF";
+
+anchors_run_obsid - Version $VERSION, ANCHORS Version $ANCH_VERS
+
+DESCRIPTION:
+
+   anchors_run_obsid is a wrapper around several Perl and Shell
+scripts, CIAO threads, and Sherpa spectral fitting scripts used
+to prepare CHANDRA cluster observations for insertion into the
+ANCHORS database
+
+REQUIRED INPUTS:
+
+All necessary archival data will be retrieved by the script
+
+USAGE:
+
+anchors_run_obsid
+
+   anchors_run_obsid <--obsid=obsid> [--obi=obi] [--debug] [--clobber=yes|no]
+
+ARGUMENTS:
+
+   obsid	   Observation ID to process (required)
+   obi             Observation interval to process
+   debug           Sets verbosity to debug level (default = not set)
+   clobber         Value of clobber to pass to CIAO tools (default = $CLOBBER)
+   continue	   Flag that tells anchors_run_obsid to continue from where it last finished processing
+
+LAST MODIFIED:
+
+   $MODDATE - by Owen W. Westbrook (owestbrook\@cfa.harvard.edu)
+
+EOF
+
+    exit 1;
+  }
+
+#!### Shutdown will handle a processing halt ###
+sub Shutdown
+  {
+    my $exitval = shift;
+
+    #!### write the cache to the paramdir (we can retrieve it for later use) ###
+    $txt->print(-body=>"storing cache");
+    unless ($ciao->store_cache)
+    {
+      $txt->print(-error=>"unable to store cache for subsequent processing");
+    }
+
+    #!### create a hash of processing settings and status data (the hash is the format accepted by the Parameter package) ###
+    #!### in the hash; type=data type, value=parameter value, comment=comment describing the parameter ###
+    my %params = (
+		  #!### the first set of keys/values are for some meta data about the run ###
+		  started                    => { type=>'s', value=>$STARTED, comment=>'GMT date when processing started' },
+		  ended                      => { type=>'s', value=>time_check(), comment=>'GMT date when processing ended' },
+		  state                      => { type=>'s', value=>(($exitval > 0) ? 'ERROR' : 'NO ERROR'), comment=>'The exit status of xatlas_reduce' },
+
+		  #!### the next group are parameters defining the state of each CIAO thread we run (if it errored or completed etc.) ###
+		  thread_collect_data        => { type=>'s',value=>$THREADS{collect_data},comment=>'Collect data thread status (Q=not run; E=error; C=completed)' },
+		  thread_merge_asol          => { type=>'s',value=>$THREADS{merge_asol},comment=>'Merge asol thread status (Q=not run; E=error; C=completed)' },
+		  thread_acis_process_events => { type=>'s',value=>$THREADS{acis_process_events},comment=>'Acis Process Events thread status (Q=not run; E=error; C=completed)' },
+		  thread_wave_detect         => { type=>'s',value=>$THREADS{wave_detect},comment=>'Wave Detect thread status (Q=not run; E=error; C=completed)' },
+		  thread_process_source_reg  => { type=>'s',value=>$THREADS{process_source_reg},comment=>'Process Source Region thread status (Q=not run; E=error; C=completed)' },
+		  thread_mk_psf_ellipse      => { type=>'s',value=>$THREADS{mk_psf_ellipse},comment=>'Make PSF Ellipse thread status (Q=not run; E=error; C=completed)' },
+		  thread_configure_yaxx      => { type=>'s',value=>$THREADS{configure_yaxx},comment=>'Configure YAXX thread status (Q=not run; E=error; C=completed)' },
+		  thread_run_yaxx            => { type=>'s',value=>$THREADS{run_yaxx},comment=>'Run YAXX thread status (Q=not run; E=error; C=completed)' },
+		  thread_run_post_yaxx       => { type=>'s',value=>$THREADS{run_post_yaxx},comment=>'Run post-YAXX thread status (Q=not run; E=error; C=completed)' },
+
+		  #!### the rest of the keys/values are the arguments to anchors_run_obsid ###
+		  clobber                    => { type=>'s', value=>$CLOBBER, comment=>'File clobber option passed to CIAO tools' },
+		  obsid                      => { type=>'i', value=>$OBSID, comment=>'Observation ID being processed' },
+		  obi                        => { type=>'i', value=>$OBI, comment=>'Observation Interval being processed' },
+		  debug                      => { type=>'s', value=>(($DEBUG) ? 'Y' : 'N'), comment=>'Debug printing flag' },
+		  froot                      => { type=>'s', value=>$FROOT, comment=>'File root for output files' },
+		  yaxx_src                   => { type=>'s', value=>$YAXX_SRC, comment=>'Yaxx option to run specific sources' },
+		  yaxx_preclean              => { type=>'s', value=>$YAXX_PRECLEAN, comment=>'Yaxx option to preclean fit data before running' },
+		  post_yaxx_opt              => { type=>'s', value=>$POST_YAXX_OPT, comment=>'Post-Yaxx option flag' },
+		 );
+
+
+    #!### create a parameter file to save the processing settings (arguments and where we left off) to in the paramdir ###
+    unless (ops_open *PARAM, '>', $PARAMFILE)
+      {
+	$txt->print(-error=>"failed to create parameter file '$PARAMFILE' to store processing settings");
+      }
+    print PARAM '#!###'." ANCHORS anchors_run_obsid - Version $VERSION - processing settings for Obsid $OBSID, Obi $OBI ".'###'."\n";
+    close PARAM;
+
+    #!### store the settings ###
+    $txt->print(-body=>"storing processing parameters");
+    my $par;
+    if ($par = Parameter->new($PARAMFILE,'readwrite',0))
+    {
+	#!### add the parameters to the new parameter file ###
+	unless ($par->create_params(%params))
+	{
+	    $txt->print(-error=>"failed to store processing parameters into '$PARAMFILE'");
+	}
+	$par->close;
+    }
+    else
+    {
+	$txt->print(-error=>"failed to open parameter file '$PARAMFILE' to store processing settings");
+    }
+
+    #!### close our OutputText object ###
+    $txt->close;
+
+    #!### exit with the given exit value ###
+    $txt->print(-results=>"exiting with exit value = $exitval");
+    exit $exitval;
+}
+
+
+#!### ReadinParams will set all of our processing settings ###
+sub ReadinParams
+{
+    #!### open the parameter file ###
+    my $par;
+    unless ($par = Parameter->new($PARAMFILE,'readonly',0))
+    {
+	$txt->print(-error=>"could not open the parameter file '$PARAMFILE' to read in processing settings");
+	return 0;
+    }
+
+    #!### get all of the parameters ###
+    my $pars = $par->list;
+    $par->close;
+
+    #!### set all of the option values from the stored settings ###
+    $CLOBBER       = $pars->{clobber}{value},
+    $OBSID         = $pars->{obsid}{value};
+    $OBI           = $pars->{obi}{value};
+    $DEBUG         = ($pars->{debug}{value} eq 'Y') ? 1 : 0;
+    $FROOT         = $pars->{froot}{value};
+
+    #!### set the status of each CIAO thread from the parameters ###
+    for my $parameter (grep /^thread_/, (keys %{$pars}))
+      {
+	#!### get the name of the parameter without the preceding 'thread_' ###
+	my $thread = $parameter;
+	$thread   =~ s/^thread_//g;
+	
+	#!### set the value ###
+	$THREADS{$thread} = $pars->{$parameter}{value};
+      }
+
+    return 1;
+  }
+
+#!### ProcessANCHORSPipeline will go through each thread and run the required ANCHORS methods and scripts to complete the thread ###
+sub ProcessANCHORSPipeline
+  {
+    #!### set the output file root if it is not set ###
+#    $FROOT = ($FROOT) ? $FROOT : 'anchors'.(sprintf '%05d', $OBSID).'_'.(sprintf '%03d', $OBI);
+
+    #!### the following groups together the order of CIAO threads and scripts to run ###
+
+    #!### data retrieval and preparation ###
+    &ProcessStep0 || return 0;
+
+    #!### source detection ###
+    &ProcessStep1 || return 0;
+
+    #!### yaxx spectral fitting ###
+    &ProcessStep2 || return 0;
+
+    #!### post yaxx: runs bblocks, quantiles, makes reports and web pages ###
+    &ProcessStep3 || return 0;
+
+    return 1;
+}
+
+#!### the subroutines below are the actual ANCHORS threads and scripts broken into steps and substeps ###
+#!### each substep has a status value tracked in the %THREADS hash - values are Q = queued (not run yet), C = completed, E = errored ###
+
+#!### ProcessStep0 will run the threads through data preparation ###
+sub ProcessStep0
+  {
+
+    # Step 0.1 - collect the data from the Chandra archive
+    if ($THREADS{collect_data} eq 'Q')
+      {
+	$txt->print(-body=>"Step 0.1 - retrieve data from the Chandra archive");
+	#!### make sure we are in the right directory ###
+	unless ((chdir $OBSDIR) && ($THREADS{collect_data} eq 'Q'))
+	  {
+	    $txt->print(-error=>"failed to chdir to $OBSDIR");
+	    $THREADS{collect_data} = 'E';
+	    return 0;
+	  }
+
+	#!### retrieve the observation data from the archive using Archive.pm, a wrapper around arc4gl ###
+	my %attr = (
+		    User       => 'anchors',
+		    Directory  => $OBSDIR,
+		    ifGuestUser => 'yes',
+		   );
+	my $arc = new CXC::Archive \%attr;
+	my %req_evt2 = (
+			dataset     => 'flight',
+			detector    => 'acis',
+			level       => 2,
+			filetype    => 'evt2',
+			obsid       => $OBSID,
+		       );
+	my %req_asol = (
+			dataset     => 'flight',
+			detector    => 'pcad',
+			subdetector => 'aca',
+			level       => 1,
+			filetype    => 'aspsol',
+			obsid       => $OBSID,
+		       );
+
+	#!### retrieve the evt2 file ###
+	$files1 = $arc->browse(\%req_evt2);
+	$files1 = $arc->retrieve(\%req_evt2);
+	unless (($files1) && ($THREADS{collect_data} eq 'Q'))
+	  {
+	    $txt->print(-error=>"failed to retrieve evt2 file from the archive");
+	    $THREADS{collect_data} = 'E';
+	    return 0;
+	  }
+
+	#!### retrieve the asol file ###
+	$files2 = $arc->browse(\%req_asol);
+	$files2 = $arc->retrieve(\%req_asol);
+	unless (($files2) && ($THREADS{collect_data} eq 'Q'))
+	  {
+	    $txt->print(-error=>"failed to retrieve asol file from the archive");
+	    $THREADS{collect_data} = 'E';
+	    return 0;
+	  }
+
+	#!### unzip the files retrieved ###
+	my $gunzip = `gunzip -f *.gz`;
+	if (($THREADS{collect_data} eq 'Q') && ($?))
+	  {
+	    $txt->print(-error=>"failed to unzip observation data");
+	    $THREADS{collect_data} = 'E';
+	    return 0;
+	  }
+      }
+    $THREADS{collect_data} = 'C' if $THREADS{collect_data} eq 'Q';
+
+    # Step 0.2 - merge asol files if necessary
+    if ($THREADS{merge_asol} eq 'Q')
+      {
+	$txt->print(-body=>"Step 0.2 - merge asol files");
+
+	#!### make sure we are in the right directory ###
+	unless ((chdir $OBSDIR) && ($THREADS{merge_asol} eq 'Q'))
+	  {
+	    $txt->print(-error=>"failed to chdir to $OBSDIR");
+	    $THREADS{merge_asol} = 'E';
+	    return 0;
+	  }
+
+	my $nsol = `ls pcadf*.fits | wc -l`;
+	if ($nsol > 1)
+	  {
+	    $txt->print(-body=>"Multiple asol files detected.  Merging...");
+	    my $merge = `/data/ANCHORS/YAXX/bin_linux/merge_asol.sh $OBSID $OBSDIR $LOGFILE`;
+	    if (($THREADS{merge_asol} eq 'Q') && ($?))
+	      {
+		$txt->print(-error=>"Failed to merge asol files");
+		$THREADS{merge_asol} = 'E';
+		return 0;
+	      }
+	  }
+	else
+	  {
+	    $txt->print(-body=>"Less than two asol files detected: proceeding to next processing step");
+	  }
+      }
+    $THREADS{merge_asol} = 'C' if $THREADS{merge_asol} eq 'Q';
+
+    # Step 0.3 - run acis_process_events with our settings
+    if ($THREADS{acis_process_events} eq 'Q')
+      {
+	$txt->print(-body=>"Step 0.3 - run acis_process_events");
+
+	#!### make sure we are in the right directory ###
+	unless ((chdir $OBSDIR) && ($THREADS{acis_process_events} eq 'Q'))
+	  {
+	    $txt->print(-error=>"failed to chdir to $OBSDIR");
+	    $THREADS{acis_process_events} = 'E';
+	    return 0;
+	  }
+	
+	#!### grab and cache the name of the evt2 file ###
+	my $evt2 = "${OBSDIR}"."/acisf"."$OBSID2"."*evt2.fits";
+	my $evt2file = `ls $evt2`;
+	chomp $evt2file;
+	$ciao->cache_file($evt2file,'evt2');
+	
+	#!### reprocess with acis_process_events if necessary, especially for cti correction ###
+	my $badprocess = 0;
+	my $ver_key = "ASCDSVER";
+	my @result = $ciao->dmkeypar("$evt2file","$ver_key");
+	my $ver = $result[0];
+	$ver =~ s/\.//g;
+	unless ($ver)
+	  {
+	    $txt->print(-error=>"could not determine ASCDS version");
+	    $THREADS{acis_process_events} = 'E';
+	    return 0;
+	  }
+	if (($ver < 740) || ($badprocess == 1))
+	  {
+	    $txt->print(-body=>"ANCHORS: Reprocessing level 1 evt file");
+
+	    #!### retrieve additional data products from the Chandra archive ###
+	    my %attr = (
+			User       => 'anchors',
+			Directory  => $OBSDIR,
+			ifGuestUser => 'yes',
+		       );
+	    my $arc = new CXC::Archive \%attr;
+	    my %req_lvl1 = (
+			    dataset  => 'flight',
+			    detector => 'acis',
+			    level    => 1,
+			    obsid    => $OBSID,
+			   );
+	    my %req_gti  = (
+			    dataset  => 'flight',
+			    detector => 'acis',
+			    level    => 1,
+			    filetype => 'gti',
+			    obsid    => $OBSID,
+			   );
+	    my %req_bias = (
+			    dataset  => 'flight',
+			    detector => 'acis',
+			    level    => 0,
+			    filetype => 'bias0',
+			    obsid    => $OBSID,
+			   );
+	    my %req_pbk  = (
+			    dataset  => 'flight',
+			    detector => 'acis',
+			    level    => 0,
+			    filetype => 'pbk',
+			    obsid    => $OBSID,
+			   );
+
+	#!### retrieve the lvl1 files ###
+	$files3 = $arc->browse(\%req_lvl1);
+	$files3 = $arc->retrieve(\%req_lvl1);
+	unless (($files3) && ($THREADS{acis_process_events} eq 'Q'))
+	  {
+	    $txt->print(-error=>"failed to retrieve level 1 files from the archive");
+	    $THREADS{acis_process_events} = 'E';
+	    return 0;
+	  }
+
+	#!### retrieve the gti file ###
+	$files4 = $arc->browse(\%req_gti);
+	$files4 = $arc->retrieve(\%req_gti);
+	unless (($files4) && ($THREADS{acis_process_events} eq 'Q'))
+	  {
+	    $txt->print(-error=>"failed to retrieve gti file from the archive");
+	    $THREADS{acis_process_events} = 'E';
+	    return 0;
+	  }
+
+	#!### retrieve the bias0 files ###
+	$files5 = $arc->browse(\%req_bias);
+	$files5 = $arc->retrieve(\%req_bias);
+	unless (($files5) && ($THREADS{acis_process_events} eq 'Q'))
+	  {
+	    $txt->print(-error=>"failed to retrieve bias files from the archive");
+	    $THREADS{acis_process_events} = 'E';
+	    return 0;
+	  }
+
+	#!### retrieve the pbk files ###
+	$files6 = $arc->browse(\%req_pbk);
+	$files6 = $arc->retrieve(\%req_pbk);
+	unless (($files6) && ($THREADS{acis_process_events} eq 'Q'))
+	  {
+	    $txt->print(-error=>"failed to retrieve pbk file from the archive");
+	    $THREADS{acis_process_events} = 'E';
+	    return 0;
+	  }
+
+	    my $repro = `/data/ANCHORS/YAXX/bin_linux/reprocess_level1.sh $OBSID $OBSDIR $LOGFILE evt2file="acis_evt2.fits"`;
+	    if (($THREADS{acis_process_events} eq 'Q') && ($?))
+		{
+		  $txt->print(-error=>"acis_process_events failed");
+		  $THREADS{acis_process_events} = 'E';
+		  return 0;
+		}
+
+	    #!### update the pointer to the evt2 file ###
+	    my $new_evt2 = "${OBSDIR}"."/acis_evt2.fits";
+	    $ciao->cache_file($new_evt2,'evt2');
+	  }
+	else
+	  {
+	    $txt->print(-body=>"Reprocessing of the level 1 evt file not necessary: Proceeding to source detection");
+	  }
+      }
+    $THREADS{acis_process_events} = 'C' if $THREADS{acis_process_events} eq 'Q';
+
+    return 1;
+  }
+
+#!### ProcessStep1 will run source detection ###
+sub ProcessStep1
+  {
+    # Step 1.1 - wave detection
+    if ($THREADS{wave_detect} eq 'Q')
+      {
+	$txt->print(-body=>"Step 1.1 - ANCHORS source detection");
+
+	#!### make sure we are in the right directory ###
+	unless ((chdir $OBSDIR) && ($THREADS{wave_detect} eq 'Q'))
+	  {
+	    $txt->print(-error=>"failed to chdir to $OBSDIR");
+	    $THREADS{wave_detect} = 'E';
+	    return 0;
+	  }
+
+	my $evt2_out = "${OBSDIR}"."/evt2_efilt.fits";
+	my $evt2file = $ciao->cache_path('evt2');
+	if (($THREADS{wavedetect} eq 'Q') && ! $evt2file)
+	  {
+	    $txt->print(-error=>"failed to retrieve evt2 file");
+	    $THREADS{wavedetect} = 'E';
+	    return 0;
+	  }
+
+	if (($THREADS{wave_detect} eq 'Q') && ! $ciao->dmcopy("${evt2file}"."[energy=300:8000]",$evt2_out,"kernel=DEFAULT verbose=2"))
+	  {
+	    $THREADS{wave_detect} = 'E';
+	    return 0;
+	  }
+
+	#!### create symbolic link to the copied evt2 file ###
+	my $evt2_link = "${WAVDIR}"."/0.3-8.0/evt2_efilt.fits";
+	my $mklink = `ln -f -s $evt2_out $evt2_link`;
+
+	#!### cd to the wave directory ###
+	my $obswavdir = "${WAVDIR}"."/0.3-8.0/";
+	unless ((chdir $obswavdir) && ($THREADS{wave_detect} eq 'Q'))
+	  {
+	    $txt->print(-error=>"changing directories to $obswavdir failed");
+	    $THREADS{wave_detect} = 'E';
+	    return 0;
+	  }
+	
+	#!### create a list of the asol files ###
+	my $asol_search = "${OBSDIR}"."/*asol*";
+	my $asollist    = "${obswavdir}"."asol1.lis";
+	my $asol_lis = `ls $asol_search > $asollist`;
+	if (($THREADS{wave_detect} eq 'Q') && ($?))
+	  {
+	    $txt->print(-error=>"asol list creation failed");
+	    $THREADS{wave_detect} = 'E';
+	    return 0;
+	  }
+	
+	#!### run wave detection ###
+	#my $wave_run = `/home/anchors/bin/wave_run.csh $OBSID2 $LOGFILE`;
+	my $wave_run = `wave_run.csh $OBSID2 $LOGFILE`;
+	if (($THREADS{wave_detect} eq 'Q') && ($?))
+	  {
+	    $txt->print(-error=>"Wave detection failed");
+	    $THREADS{wave_detect} = 'E';
+	    return 0;
+	  }
+      }
+    $THREADS{wave_detect} = 'C' if $THREADS{wave_detect} eq 'Q';
+
+    # Step 1.2 - source region processing
+    if ($THREADS{process_source_reg} eq 'Q')
+      {
+	$txt->print(-body=>"Step 1.2 - ANCHORS source region processing");
+
+	#!### make sure we are in the correct directory ###
+	my $obswavdir = "${WAVDIR}"."/0.3-8.0/";
+	unless ((chdir $obswavdir) && ($THREADS{process_source_reg} eq 'Q'))
+	  {
+	    $txt->print(-error=>"changing directories to $obswavdir failed");
+	    $THREADS{process_source_reg} = 'E';
+	    return 0;
+	  }
+
+	#!### cp evt2 exposure map file to the workdir ###
+	my $evt2_copy = "$obswavdir"."evt2_efiltbin4_expmap.fits";
+	unless (-r $evt2_copy)
+	  {
+	    $evt2_copy = "$obswavdir"."evt2_efiltbin2_expmap.fits";
+	  }
+	
+	my $cp_evt2 = `cp $evt2_copy $OBSDIR`;
+	if (($THREADS{process_source_reg} eq 'Q') && ($?))
+	  {
+	    $txt->print(-error=>"failed to copy evt2 file");
+	    $THREADS{process_source_reg} = 'E';
+	    return 0;
+	  }
+
+	#!### cache the copied evt2 file ###
+	$ciao->cache_file($evt2_copy,'evt2_filt',0);
+	
+	#!### cache the evt2 source file ###
+	my $evt2_src = "${obswavdir}"."evt2_efilt_src.fits";
+	$ciao->cache_file($evt2_src,'evt2_src',0);
+	
+	#!### run dmlist on the evt2 file ###
+	my $dmlist_string = "${evt2_src}"."[cols shape,ra,dec,r,rotang]";
+	unless (($THREADS{process_source_reg} eq 'Q') && ($ciao->_ciao_doer("dmlist \'$dmlist_string\' data outfile=src.reg",0)))
+	  {
+	    $txt->print(-error=>"dmlist failed on $evt2_src");
+	    $THREADS{process_source_reg} = 'E';
+	    return 0;
+	  }
+
+	#!### convert the src.reg to a ds9 version ###
+	my $convert_src = `convert_src.pl src.reg`;
+	if (($THREADS{process_source_reg} eq 'Q') && ($?))
+	  {
+	    $THREADS{process_source_reg} = 'E';
+	    return 0;
+	  }
+
+	#!### cd to the $yaxx/bin directory ###
+	unless (($THREADS{process_source_reg} eq 'Q') && (chdir $YAXX_BIN))
+	  {
+	    $txt->print(-error=>"failed to change directories to $YAXX_BIN");
+	    $THREADS{process_source_reg} = 'E';
+	    return 0;
+	  }
+
+	#!### run calc_theta_phi ###
+	my $run_ctp = `calc_theta_phi.pl $OBSID`;
+	if (($THREADS{process_source_reg} eq 'Q') && ($?))
+	  {
+	    $txt->print(-error=>"failed to run calc_theta_phi.pl");
+	    $THREADS{process_source_reg} = 'E';
+	    return 0;
+	  }
+
+      }
+    $THREADS{process_source_reg} = 'C' if $THREADS{process_source_reg} eq 'Q';
+
+    # Step 1.3 - make psf ellipse
+    if ($THREADS{mk_psf_ellipse} eq 'Q')
+      {
+	$txt->print(-body=>"Step 1.3 - make psf ellipse for each source");
+
+	#!### make sure we are in the correct directory ###
+	unless (($THREADS{mk_psf_ellipse} eq 'Q') && (chdir $YAXX_BIN))
+	  {
+	    $txt->print(-error=>"failed to change directories to $YAXX_BIN");
+	    $THREADS{mk_psf_ellipse} = 'E';
+	    return 0;
+	  }
+
+	#!### run dmkeypar to determine the ROLL_NOM ###
+	my $evt2 = $ciao->cache_path('evt2');
+	my $evt2file = `ls $evt2`;
+	chomp $evt2file;
+	my $roll_key = "ROLL_NOM";
+	my @result = $ciao->dmkeypar("$evt2file","$roll_key");
+	my $obs_roll = $result[0];
+
+	#!### start idl to run mk_psf_ellipse.pro
+	my $idl_cmd = `idl <<EOF
+.run $YAXX_DIR/bin/mk_psf_ellipse_exc.pro
+mk_psf_ellipse_exc, $OBSID, $obs_roll
+EOF`;	
+	if (($THREADS{mk_psf_ellipse} eq 'Q') && ($?))
+	  {
+	    $txt->print(-error=>"failed to make psf ellipses");
+	    $THREADS{mk_psf_ellipse} = 'E';
+	    return 0;
+	  }
+
+      }
+    $THREADS{mk_psf_ellipse} = 'C' if $THREADS{mk_psf_ellipse} eq 'Q';
+
+    return 1;
+  }
+
+#!### ProcessStep2 will run yaxx on each source for spectral fitting ###
+sub ProcessStep2
+  {
+
+    # Step 2.1 - configure yaxx
+    if ($THREADS{configure_yaxx} eq 'Q')
+      {
+	$txt->print(-body=>"Step 2.1 - preparing to run YAXX");
+
+	#!### make sure we are in the correct directory ###
+	unless (($THREADS{configure_yaxx} eq 'Q') && (chdir $YAXX_BIN))
+	  {
+	    $txt->print(-error=>"failed to change directories to $YAXX_BIN");
+	    $THREADS{configure_yaxx} = 'E';
+	    return 0;
+	  }
+
+	#!### make copies of the required files ###
+	my $src_reg     = "${YAXX_BIN}"."/src_psf_ell.reg";
+	my $obs_src_reg = "${YAXX_BIN}"."/src_psf_ell_"."${OBSID}".".reg";
+	my $cp_src = `cp $src_reg $obs_src_reg`;
+	if (($THREADS{configure_yaxx} eq 'Q') && ($?))
+	  {
+	    $txt->print(-error=>"failed to copy source region file");
+	    $THREADS{configure_yaxx} = 'E';
+	    return 0;
+	  }
+	my $bkg_reg     = "${YAXX_BIN}"."/bkg_psf_ell.reg";
+	my $obs_bkg_reg = "${YAXX_BIN}"."/bkg_psf_ell_"."${OBSID}".".reg";
+	my $cp_bkg = `cp $bkg_reg $obs_bkg_reg`;
+	if (($THREADS{configure_yaxx} eq 'Q') && ($?))
+	  {
+	    $txt->print(-error=>"failed to copy background region file");
+	    $THREADS{configure_yaxx} = 'E';
+	    return 0;
+	  }
+	my $theta_phi     = "${YAXX_BIN}"."/calc_theta_phi.out";
+        my $obs_theta_phi = "${YAXX_BIN}"."/calc_theta_phi_"."${OBSID}".".out";
+	my $cp_theta_phi = `cp $theta_phi $obs_theta_phi`;
+	if (($THREADS{configure_yaxx} eq 'Q') && ($?))
+	  {
+	    $txt->print(-error=>"failed to copy calc_theta_phi output file");
+	    $THREADS{configure_yaxx} = 'E';
+	    return 0;
+	  }
+
+	#!### run distribute_reg.pl ###
+	my $distribute = `distribute_reg.pl $OBSID`;
+	if (($THREADS{configure_yaxx} eq 'Q') && ($?))
+	  {
+	    $txt->print(-error=>"failed to run distribute_reg.pl");
+	    $THREADS{configure_yaxx} = 'E';
+	    return 0;
+	  }
+
+	#!### copy sample.rdb to the obsid directory and cache the file###
+	my $s_rdb = "${YAXX_BIN}"."/sample.rdb";
+	my $sample_rdb = "${WORKDIR}"."/sample.rdb";
+	my $cp_rdb = `cp $s_rdb $WORKDIR`;
+	if (($THREADS{configure_yaxx} eq 'Q') && ($?))
+	  {
+	    $txt->print(-error=>"failed to copy sample.rdb to $WORKDIR");
+	    $THREADS{configure_yaxx} = 'E';
+	    return 0;
+	  }
+	
+	#!### cache sample.rdb ###
+	$ciao->cache_file($sample_rdb,'sample_rdb',0);
+
+	#!### return to the working (obsid) directory ###
+	unless (($THREADS{configure_yaxx} eq 'Q') && (chdir $WORKDIR))
+	  {
+	    $txt->print(-error=>"failed to change directories to $WORKDIR");
+	    $THREADS{configure_yaxx} = 'E';
+	    return 0;
+	  }
+	
+	#!### copy the yaxx config file to $YAXX_DIR ###
+	my $yaxx_cfg = "${YAXX_DIR}"."/yaxx.cfg";
+	my $cp_cfg = `cp $yaxx_cfg $WORKDIR`;
+	if (($THREADS{configure_yaxx} eq 'Q') && ($?))
+	  {
+	    $txt->print(-error=>"failed to copy the yaxx.cfg file to $WORKDIR");
+	    $THREADS{configure_yaxx} = 'E';
+	    return 0;
+	  }
+
+	#!### store the cache in case YAXX kills itself ###
+	$txt->print(-body=>"storing cache before running YAXX");
+	unless ($ciao->store_cache)
+	  {
+	    $txt->print(-error=>"unable to store cache for subsequent processing");
+	    $THREADS{configure_yaxx} = 'E';
+	    return 0;
+	  }
+
+      }
+    $THREADS{configure_yaxx} = 'C' if $THREADS{configure_yaxx} eq 'Q';
+
+    # Step 2.2 - run yaxx
+    if ($THREADS{run_yaxx} eq 'Q')
+      {
+	$txt->print(-body=>"Step 2.2 - run YAXX for spectral fitting");
+
+	#!### make sure we are in the correct directory ###
+	unless ((chdir $WORKDIR) && ($THREADS{run_yaxx} eq 'Q'))
+	  {
+	    $txt->print(-error=>"changing directories to $WORKDIR failed");
+	    $THREADS{run_yaxx} = 'E';
+	    return 0;
+	  }
+
+	#!### run yaxx ###
+	if ($YAXX_PRECLEAN) {
+	  $YAXX_PRECLEAN = "-preclean "."$YAXX_PRECLEAN";
+	}
+#  	my $yaxx_cmd = `$YAXX_EXE -preclean all 1>> $LOGFILE 2>&1`;
+	my $yaxx_cmd = `$YAXX_EXE $YAXX_PRECLEAN 1>> $LOGFILE 2>&1`;
+	if (($THREADS{run_yaxx} eq 'Q') && ($?))
+	  {
+	    $txt->print(-error=>"yaxx run failed");
+	    $THREADS{run_yaxx} = 'E';
+	    return 0;
+	  }
+      }
+    $THREADS{run_yaxx} = 'C' if $THREADS{run_yaxx} eq 'Q';
+
+    return 1;
+  }
+
+#!### ProcessStep3 will run post_yaxx on each source ###
+sub ProcessStep3
+  {
+
+    # Step 3 - run post_yaxx
+    if ($THREADS{run_post_yaxx} eq 'Q')
+      {
+	$txt->print(-body=>"Step 3 - run post-YAXX processing");
+	my $strt = `echo "ANCHORS: Running Post-YAXX Processing" >> $LOGFILE`;
+
+	#!### chdir to the $yaxx/bin directory ###
+	unless (($THREADS{run_post_yaxx} eq 'Q') && (chdir $BIN_LINUX))
+	  {
+	    $txt->print(-error=>"failed to change directories to $BIN_LINUX");
+	    $THREADS{run_post_yaxx} = 'E';
+	    return 0;
+	  }
+	
+	#!### retrieve sample.rdb ###
+	my $sample_rdb = $ciao->cache_path('sample_rdb');
+	if (! $sample_rdb)
+	  {
+	    $sample_rdb = "${WORKDIR}/sample.rdb";
+	    $ciao->cache_file($sample_rdb,'sample_rdb');
+	  }
+	unless (($THREADS{run_post_yaxx} eq 'Q') && (-r $sample_rdb))
+	  {
+	    $txt->print(-error=>"failed to retrieve sample.rdb");
+	    $THREADS{run_post_yaxx} = 'E';
+	    return 0;
+	  }
+
+	#!### retrieve the appropriate evt2 file (we only want the file name, not the path) ###
+	my $evt2_filt = $ciao->cache_path('evt2_filt');
+	if (! $evt2_filt)
+	  {
+	    $evt2_filt = "${OBSDIR}/evt2_efiltbin4_expmap.fits";
+	    $ciao->cache_file($evt2_filt,'evt2_filt');
+	  }
+	#!### make sure the file exists ###
+	unless (($THREADS{run_post_yaxx} eq 'Q') && (-r $evt2_filt))
+	  {
+	    $txt->print(-error=>"failed to retrieve the appropriate evt2 file");
+	    $THREADS{run_post_yaxx} = 'E';
+	    return 0;
+	  }
+	#!### take only the file name (not the path) ###
+	$evt2_filt =~ s/.*(evt2_efiltbin[0-9]{1}_expmap.fits)/$1/g;
+
+	#!### run post_yaxx ###
+	my $post_yaxx = `/data/ANCHORS/YAXX/bin_linux/post_yaxx.pl $POST_YAXX_OPT $sample_rdb $OBSID $evt2_filt 1>> $LOGFILE 2>&1`;
+	if (($THREADS{run_post_yaxx} eq 'Q') && ($?))
+	  {
+	    $txt->print(-error=>"post_yaxx.pl failed");
+	    $THREADS{run_post_yaxx} = 'E';
+	    return 0;
+	  }
+      }
+    $THREADS{run_post_yaxx} = 'C' if $THREADS{run_post_yaxx} eq 'Q';
+
+    return 1;
+  }
+
