@@ -75,29 +75,6 @@ print OUTSPEC ",,,erg\/cm^2\/s,erg\/cm^2\/s,erg\/cm^2\/s,,";
 print OUTSPEC ",10^22\/cm^2,10^22\/cm^2,keV,keV,keV,keV";
 print OUTSPEC ",,,erg\/cm^2\/s,erg\/cm^2\/s,erg\/cm^2\/s,,\n";
 
-open(OUTAPEC,">$out_root/$data_dir\_apec.csv");
-print OUTAPEC ",,,c_ap,-->,,,,";
-print OUTAPEC ",,,ABS.,UNABS.,UNABS.,RED.,DEG.OF";
-print OUTAPEC ",c_ap2,-->,,,,";
-print OUTAPEC ",,,ABS.,UNABS.,UNABS.,RED.,DEG.OF";
-print OUTAPEC ",c_ap2a,-->,,,,";
-print OUTAPEC ",,,ABS.,UNABS.,UNABS.,RED.,DEG.OF\n";
-print OUTAPEC "ID,RA,DEC,";
-print OUTAPEC "NH,NH_ERR,KT1,KT1_ERR,KT2,KT2_ERR";
-print OUTAPEC ",ABUND,ABUND_ERR,FLUX,KT1_FLUX,KT2_FLUX,CHI^2,FREEDOM";
-print OUTAPEC ",NH,NH_ERR,KT1,KT1_ERR,KT2,KT2_ERR";
-print OUTAPEC ",ABUND,ABUND_ERR,FLUX,KT1_FLUX,KT2_FLUX,CHI^2,FREEDOM";
-print OUTAPEC ",NH,NH_ERR,KT1,KT1_ERR,KT2,KT2_ERR";
-print OUTAPEC ",ABUND,ABUND_ERR,FLUX,KT1_FLUX,KT2_FLUX,CHI^2,FREEDOM\n";
-print OUTAPEC ",,,10^22\/cm^2,10^22\/cm^2,keV,keV,N/A,N/A";
-print OUTAPEC ",,,erg\/cm^2\/s,erg\/cm^2\/s,N\/A,,";
-print OUTAPEC ",10^22\/cm^2,10^22\/cm^2,keV,keV,N/A,N/A";
-print OUTAPEC ",,,erg\/cm^2\/s,erg\/cm^2\/s,N\/A,,";
-print OUTAPEC ",10^22\/cm^2,10^22\/cm^2,keV,keV,keV,keV";
-print OUTAPEC ",,,erg\/cm^2\/s,erg\/cm^2\/s,erg\/cm^2\/s,,";
-print OUTAPEC ",10^22\/cm^2,10^22\/cm^2,keV,keV,keV,keV";
-print OUTAPEC ",,,erg\/cm^2\/s,erg\/cm^2\/s,erg\/cm^2\/s,,\n";
-
 open(OUTIR,">$out_root/$data_dir\_ir.csv");
 print OUTIR "SRC,,,,,IR,IR,OFFSET,J,J,H,H,K,K,QUAL\n";
 print OUTIR "ID,RA,DEC,RA,DEC,RA,DEC,arcsec,MAG,ERR,MAG,ERR,MAG,ERR,FLAGS\n";
@@ -132,16 +109,6 @@ while ($inline=<IN>) {
     print OUTSPEC $trap[$itrap];
   }
   print OUTSPEC "\n";
-
-  $command="$xsltproc -param vobs $data_dir -param vsrcid $src -param vsect \"\'apec\'\" $xsl_file $xml_file";
-  ##c#print "$command\n";
-  @trap=`$command`;
-  for ($itrap=0;$itrap<=$#trap;$itrap++) {
-    chomp $trap[$itrap];
-    $trap[$itrap]=~s/\s+//;
-    print OUTAPEC $trap[$itrap];
-  }
-  print OUTAPEC "\n";
 
   $command="$xsltproc -param vobs $data_dir -param vsrcid $src -param vsect \"\'bblocks\'\" $xsl_file $xml_file";
   ##c#print "$command\n";
@@ -185,6 +152,5 @@ close OUTTOP;
 close OUTBBLK;
 close OUTLC;
 close OUTSPEC;
-close OUTAPEC;
 close OUTIR;
 #

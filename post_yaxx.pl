@@ -101,6 +101,7 @@ if ($proc eq "-p" || $proc eq "-f" || $proc eq "-r" || $proc eq "-s") {
 if ($proc eq "-p" || $proc eq "-f" || $proc eq "-r" || $proc eq "-t") {
   print "assemble_csv.pl $ARGV[0] $ARGV[1]\n";
   `$prog_dir/assemble_csv.pl $ARGV[0] $ARGV[1]`;
+  `$prog_dir/assemble_apec.pl $ARGV[0] $ARGV[1]`;
 
   print "assemble_obs.pl $ARGV[0] $ARGV[1]\n";
   `$prog_dir/assemble_obs.pl $ARGV[0] $ARGV[1]`;

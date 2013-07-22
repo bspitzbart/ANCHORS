@@ -1,4 +1,4 @@
-bblocks_plot,'../12392/sample_all.rdb', '12392'
-spectra_plot,'../12392/sample_all.rdb', '12392'
-GLvary_plot,'../12392/sample_all.rdb', '12392'
+bblocks_plot,'../04479/sample.rdb', '4479'
+spectra_plot,'../04479/sample.rdb', '4479'
+GLvary_plot,'../04479/sample.rdb', '4479'
 exit
