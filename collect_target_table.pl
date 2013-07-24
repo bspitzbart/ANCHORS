@@ -1103,7 +1103,7 @@ while ($inline=<IN>) {
   #  print OUT "0";
   #} # if ($max_deriv >= 10) {
   #print OUT "  </FLARE_FLAG>\n";
-  print OUT "  <BBLOCKS>\n";
+  print OUT "  <BBLOCKS n_bblocks=\"$bbnum\">\n";
   print OUT "    <BBLOCKS_SIG sig=\"$bbsig\">\n";
   $lcl_pflg = 0;
   for ($ibblocks=0;$ibblocks<=$#levels;$ibblocks++) {
